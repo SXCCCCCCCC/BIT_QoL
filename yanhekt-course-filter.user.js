@@ -1,11 +1,11 @@
 // ==UserScript==
 // @name         延河课堂 - 课程列表显示过滤
 // @namespace    https://aita.yanhekt.cn/
-// @version      2.0.0
+// @version      2.1.0
 // @description  在“我的课程”搜索按钮右侧嵌入开关：隐藏「大学物理实验」系列课程、隐藏任务数为 0 的课程；状态本地记忆，过滤结果跨页生效
 // @author       SXCCCCCCCC
 // @match        https://aita.yanhekt.cn/*
-// @run-at       document-idle
+// @run-at       document-start
 // @grant        none
 // ==/UserScript==
 
@@ -133,12 +133,19 @@
 
   // ===== 取数 =====
   const API_PATH = '/personal/courseapi/vlabpassportapi/v1/account-profile/course';
-  const CACHE_TTL = 120000; // 缓存 2 分钟，避免长会话里选课/退课数据陈旧
-  const courseCache = new Map();
+  const CACHE_TTL = 300000;      // 持久缓存 5 分钟
+  const FRESH_MS = 60000;        // 超过 1 分钟的数据：先秒出，再后台刷新
+  const PERSIST_PREFIX = 'yhkt.courseCache.v1:';
+  const courseCache = new Map(); // key -> { data, ts }
+  const inflight = new Map();    // key -> Promise，避免并发重复请求
 
   function searchKey(search) {
     const obj = search || {};
-    return JSON.stringify(Object.keys(obj).sort().map(k => [k, obj[k]]));
+    // 空值参数等价于没传，保证预取和真实请求命中同一个缓存键
+    const pairs = Object.keys(obj).sort()
+      .filter(k => obj[k] !== undefined && obj[k] !== null && String(obj[k]) !== '')
+      .map(k => [k, obj[k]]);
+    return JSON.stringify(pairs);
   }
 
   function getCached(key) {
@@ -148,14 +155,32 @@
       courseCache.delete(key);
       return null;
     }
-    return entry.data;
+    return entry;
   }
 
-  async function fetchAllCourses(search) {
-    const key = searchKey(search);
-    const cached = getCached(key);
-    if (cached) return cached;
+  function readPersisted(key) {
+    try {
+      const raw = sessionStorage.getItem(PERSIST_PREFIX + key);
+      if (!raw) return null;
+      const entry = JSON.parse(raw);
+      if (!entry || !Array.isArray(entry.data) || !entry.ts) return null;
+      if (Date.now() - entry.ts > CACHE_TTL) {
+        sessionStorage.removeItem(PERSIST_PREFIX + key);
+        return null;
+      }
+      return entry;
+    } catch (e) {
+      return null;
+    }
+  }
 
+  function writePersisted(key, data) {
+    try {
+      sessionStorage.setItem(PERSIST_PREFIX + key, JSON.stringify({ data, ts: Date.now() }));
+    } catch (e) { /* 存储满 / 隐私模式忽略 */ }
+  }
+
+  async function requestAll(search, key) {
     const all = [];
     let total = Infinity;
     let page = 1;
@@ -185,8 +210,40 @@
       page++;
     }
 
-    courseCache.set(key, { data: all, ts: Date.now() });
-    return all;
+    const entry = { data: all, ts: Date.now() };
+    courseCache.set(key, entry);
+    writePersisted(key, all);
+    return entry;
+  }
+
+  function startFetch(search, key) {
+    if (inflight.has(key)) return inflight.get(key);
+    const p = requestAll(search, key).finally(() => inflight.delete(key));
+    inflight.set(key, p);
+    return p;
+  }
+
+  function refreshInBackground(search, key) {
+    startFetch(search, key).then(() => {
+      const vm = getVm(document);
+      if (vm && filtersActive() && searchKey(vm.courseSearch) === key) filteredLoad(vm);
+    }).catch(() => {});
+  }
+
+  function fetchAllCourses(search) {
+    const key = searchKey(search);
+    const cached = getCached(key);
+    if (cached) {
+      if (Date.now() - cached.ts > FRESH_MS) refreshInBackground(search, key);
+      return Promise.resolve(cached.data);
+    }
+    const persisted = readPersisted(key);
+    if (persisted) {
+      courseCache.set(key, persisted);
+      if (Date.now() - persisted.ts > FRESH_MS) refreshInBackground(search, key);
+      return Promise.resolve(persisted.data);
+    }
+    return startFetch(search, key).then(entry => entry.data);
   }
 
   // ===== Vue 实例接管 =====
@@ -333,7 +390,7 @@
       if (filtersActive() && vm[PATCH_FLAG]) {
         const key = searchKey(vm.courseSearch);
         const cached = getCached(key);
-        const expected = cached ? cached.filter(c => !shouldHide(c)).length : null;
+        const expected = cached ? cached.data.filter(c => !shouldHide(c)).length : null;
         const listBad = Array.isArray(vm.courseList) && vm.courseList.some(shouldHide);
         const totalBad = expected !== null &&
           Number(vm.coursePage && vm.coursePage.total) !== expected;
@@ -346,7 +403,22 @@
   }
 
   function boot(doc) {
-    if (!doc || !doc.body) return;
+    if (!doc) return;
+
+    // 课程页：趁站点自身启动，提前拉全量列表；与后续请求共用同一个 Promise
+    if (doc.location && String(doc.location.hash).indexOf('myStudy/myCourse') !== -1) {
+      fetchAllCourses({}).catch(() => {});
+    }
+
+    if (!doc.body) {
+      if (doc.readyState === 'loading') {
+        doc.addEventListener('DOMContentLoaded', () => boot(doc), { once: true });
+      } else {
+        setTimeout(() => boot(doc), 0);
+      }
+      return;
+    }
+
     scheduleEnsure(doc);
     new MutationObserver(() => scheduleEnsure(doc)).observe(doc.body, {
       childList: true,
