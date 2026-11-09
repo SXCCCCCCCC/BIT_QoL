@@ -5,6 +5,8 @@
 // @description  在“我的课程”搜索按钮右侧嵌入开关：隐藏「大学物理实验」系列课程、隐藏任务数为 0 的课程；状态本地记忆，过滤结果跨页生效
 // @author       SXCCCCCCCC
 // @match        https://aita.yanhekt.cn/*
+// @updateURL    https://raw.githubusercontent.com/SXCCCCCCCC/BIT_QoL/main/yanhekt-course-filter.user.js
+// @downloadURL  https://raw.githubusercontent.com/SXCCCCCCCC/BIT_QoL/main/yanhekt-course-filter.user.js
 // @run-at       document-start
 // @grant        none
 // ==/UserScript==
